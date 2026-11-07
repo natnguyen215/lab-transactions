@@ -3,7 +3,7 @@ from sqlalchemy.sql import text
 import os
 import logging
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.WARNING,
     format=f'%(asctime)s.%(msecs)03d - {os.getpid()} - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
 )
@@ -27,30 +27,30 @@ class Ledger:
     def get_all_account_ids(self):
         '''
         This function is used inside of the random_transfers.py script.
-
-        The transaction block is required even for a read-only query:
-        SQLAlchemy 2.0 autobegins a transaction on the first execute(),
-        and leaving it open would make the next connection.begin() fail.
         '''
-        with self.connection.begin():
-            sql = text('SELECT account_id FROM accounts;')
-            logging.debug(sql)
-            results = self.connection.execute(sql)
-            return [row[0] for row in results.all()]
+        sql = text('SELECT account_id FROM accounts;')
+        logging.debug(sql)
+        results = self.connection.execute(sql)
+        return [row[0] for row in results.all()]
 
     def create_account(self, name):
         '''
-        In order to create an account, we need to insert a new row into the "accounts" table and the "balances" table.
+        In order to create an account, we need to insert a new row into the "accounts" able and the "balances" table.
         Because of the FOREIGN KEY constraint on the "balances" table,
         we need to know the "account_id" column of the row we've inserted into "accounts".
         This value is generated for us automatically by the database, and not within python.
-        We use INSERT ... RETURNING so the database hands the value back directly,
-        instead of querying by name afterwards (which picks the wrong row for duplicate names).
+        So we need to query the database after inserting into "accounts" to get the value.
         '''
         with self.connection.begin():
 
-            # insert the name into "accounts" and get the generated account_id back
-            sql = text('INSERT INTO accounts (name) VALUES (:name) RETURNING account_id;')
+            # insert the name into "accounts"
+            sql = text('INSERT INTO accounts (name) VALUES (:name);')
+            sql = sql.bindparams(name=name)
+            logging.debug(sql)
+            self.connection.execute(sql)
+
+            # get the account_id for the new account
+            sql = text('SELECT account_id FROM accounts WHERE name=:name')
             sql = sql.bindparams(name=name)
             logging.debug(sql)
             results = self.connection.execute(sql)
@@ -72,49 +72,56 @@ class Ledger:
         This function adds a row to the "transactions" table with the specified input values.
         It also updates the "balances" table to apply the debits and credits to the appropriate accounts.
 
-        The ACCESS EXCLUSIVE lock on "balances" prevents the lost update race condition:
-        it makes each transfer's SELECT-then-UPDATE sequence atomic with respect to
-        other transfers, so no transaction can read a balance that another is about to overwrite.
-        The lock is held until the transaction commits, so only one transfer touches
-        "balances" at a time.
+        Notice two differences between this function and the code in `create_account`:
+        1. This function does not use the connection.begin() function to start a transaction.
+            When commands are not inside of a transaction block like this,
+            then SQLAlchemy uses implicit transactions by default.
+            This means that whenever a connection.execute command is called,
+            SQLAlchemy will also call the BEGIN command internally.
+            In order for a database modifying command (e.g. INSERT or UPDATE) to actually commit the value,
+            you must call the self.connection.commit() command explicitly.
+            It is also possible to enable "autocommit" to automatically commit these changes for you.
+            The documentation contains detailed explanations: <https://docs.sqlalchemy.org/en/20/tutorial/dbapi_transactions.html>.
+
+        2. This code uses f-strings instead of bind parameters.
+            This can result in SQL injection vulnerabilities.
         '''
-        with self.connection.begin():
-            sql = text('LOCK TABLE balances IN ACCESS EXCLUSIVE MODE;')
-            logging.debug(sql)
-            self.connection.execute(sql)
+        self.connection.commit()
+        while True:
+            try:
+                with self.connection.begin():
 
-            # insert the transaction
-            sql = text('INSERT INTO transactions (debit_account_id, credit_account_id, amount) VALUES (:debit_account_id, :credit_account_id, :amount);')
-            sql = sql.bindparams(
-                debit_account_id=debit_account_id,
-                credit_account_id=credit_account_id,
-                amount=amount
-            )
-            logging.debug(sql)
-            self.connection.execute(sql)
+                    # insert the transaction
+                    sql = text(f'INSERT INTO transactions (debit_account_id, credit_account_id, amount) VALUES ({debit_account_id}, {credit_account_id}, {amount});')
+                    logging.debug(sql)
+                    self.connection.execute(sql)
 
-            # read and write the debit account's balance
-            sql = text('SELECT balance FROM balances WHERE account_id = :account_id;')
-            sql = sql.bindparams(account_id=debit_account_id)
-            logging.debug(sql)
-            results = self.connection.execute(sql)
-            debit_account_balance = results.first()[0]
+                    # update the debit account balance
+                    sql = text(f'SELECT balance FROM balances WHERE account_id = {debit_account_id} FOR UPDATE;')
+                    logging.debug(sql)
+                    results = self.connection.execute(sql)
+                    debit_account_balance = results.first()[0]
 
-            debit_new_balance = debit_account_balance - amount
-            sql = text('UPDATE balances SET balance=:balance WHERE account_id = :account_id;')
-            sql = sql.bindparams(balance=debit_new_balance, account_id=debit_account_id)
-            logging.debug(sql)
-            self.connection.execute(sql)
+                    debit_new_balance = debit_account_balance - amount
+                    sql = text(f'UPDATE balances SET balance={debit_new_balance} WHERE account_id = {debit_account_id};')
+                    logging.debug(sql)
+                    self.connection.execute(sql)
 
-            # read and write the credit account's balance
-            sql = text('SELECT balance FROM balances WHERE account_id = :account_id;')
-            sql = sql.bindparams(account_id=credit_account_id)
-            logging.debug(sql)
-            results = self.connection.execute(sql)
-            credit_account_balance = results.first()[0]
+                    sql = text(
+                        f'SELECT balance FROM balances '
+                        f'WHERE account_id = {credit_account_id} FOR UPDATE;'
+                    )
+                    logging.debug(sql)
+                    results = self.connection.execute(sql)
+                    credit_account_balance = results.first()[0]
 
-            credit_new_balance = credit_account_balance + amount
-            sql = text('UPDATE balances SET balance=:balance WHERE account_id = :account_id;')
-            sql = sql.bindparams(balance=credit_new_balance, account_id=credit_account_id)
-            logging.debug(sql)
-            self.connection.execute(sql)
+                    credit_new_balance = credit_account_balance + amount
+                    sql = text(
+                        f'UPDATE balances SET balance={credit_new_balance} '
+                        f'WHERE account_id = {credit_account_id};'
+                    )
+                    logging.debug(sql)
+                    self.connection.execute(sql)
+                break
+            except sqlalchemy.exc.OperationalError:
+                self.connection.rollback()
