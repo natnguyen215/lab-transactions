@@ -78,43 +78,48 @@ class Ledger:
         The lock is held until the transaction commits, so only one transfer touches
         "balances" at a time.
         '''
-        with self.connection.begin():
-            sql = text('LOCK TABLE balances IN ACCESS EXCLUSIVE MODE;')
-            logging.debug(sql)
-            self.connection.execute(sql)
+        while True:
+            try:
+                with self.connection.begin():
+                    #sql = text('LOCK TABLE balances IN ACCESS EXCLUSIVE MODE;')
+                    #logging.debug(sql)
+                    #self.connection.execute(sql)
 
-            # insert the transaction
-            sql = text('INSERT INTO transactions (debit_account_id, credit_account_id, amount) VALUES (:debit_account_id, :credit_account_id, :amount);')
-            sql = sql.bindparams(
-                debit_account_id=debit_account_id,
-                credit_account_id=credit_account_id,
-                amount=amount
-            )
-            logging.debug(sql)
-            self.connection.execute(sql)
+                    # insert the transaction
+                    sql = text('INSERT INTO transactions (debit_account_id, credit_account_id, amount) VALUES (:debit_account_id, :credit_account_id, :amount);')
+                    sql = sql.bindparams(
+                        debit_account_id=debit_account_id,
+                        credit_account_id=credit_account_id,
+                        amount=amount
+                    )
+                    logging.debug(sql)
+                    self.connection.execute(sql)
 
-            # read and write the debit account's balance
-            sql = text('SELECT balance FROM balances WHERE account_id = :account_id;')
-            sql = sql.bindparams(account_id=debit_account_id)
-            logging.debug(sql)
-            results = self.connection.execute(sql)
-            debit_account_balance = results.first()[0]
+                    # read and write the debit account's balance
+                    sql = text('SELECT balance FROM balances WHERE account_id = :account_id FOR UPDATE;')
+                    sql = sql.bindparams(account_id=debit_account_id)
+                    logging.debug(sql)
+                    results = self.connection.execute(sql)
+                    debit_account_balance = results.first()[0]
 
-            debit_new_balance = debit_account_balance - amount
-            sql = text('UPDATE balances SET balance=:balance WHERE account_id = :account_id;')
-            sql = sql.bindparams(balance=debit_new_balance, account_id=debit_account_id)
-            logging.debug(sql)
-            self.connection.execute(sql)
+                    debit_new_balance = debit_account_balance - amount
+                    sql = text('UPDATE balances SET balance=:balance WHERE account_id = :account_id;')
+                    sql = sql.bindparams(balance=debit_new_balance, account_id=debit_account_id)
+                    logging.debug(sql)
+                    self.connection.execute(sql)
 
-            # read and write the credit account's balance
-            sql = text('SELECT balance FROM balances WHERE account_id = :account_id;')
-            sql = sql.bindparams(account_id=credit_account_id)
-            logging.debug(sql)
-            results = self.connection.execute(sql)
-            credit_account_balance = results.first()[0]
+                    # read and write the credit account's balance
+                    sql = text('SELECT balance FROM balances WHERE account_id = :account_id FOR UPDATE;')
+                    sql = sql.bindparams(account_id=credit_account_id)
+                    logging.debug(sql)
+                    results = self.connection.execute(sql)
+                    credit_account_balance = results.first()[0]
 
-            credit_new_balance = credit_account_balance + amount
-            sql = text('UPDATE balances SET balance=:balance WHERE account_id = :account_id;')
-            sql = sql.bindparams(balance=credit_new_balance, account_id=credit_account_id)
-            logging.debug(sql)
-            self.connection.execute(sql)
+                    credit_new_balance = credit_account_balance + amount
+                    sql = text('UPDATE balances SET balance=:balance WHERE account_id = :account_id;')
+                    sql = sql.bindparams(balance=credit_new_balance, account_id=credit_account_id)
+                    logging.debug(sql)
+                    self.connection.execute(sql)
+                break 
+            except OperationalError:
+                continue
