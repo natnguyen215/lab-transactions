@@ -121,5 +121,5 @@ class Ledger:
                     logging.debug(sql)
                     self.connection.execute(sql)
                 break 
-            except OperationalError:
+            except:
                 continue
